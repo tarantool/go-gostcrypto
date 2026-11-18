@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `streebog` no longer builds its 1 MiB lookup table in `init()`. The table is
+  built on the first `New256`, `New512`, `Sum256` or `Sum512` call, and by
+  linearity from 512 basis entries instead of 16 384 full evaluations, so it
+  takes about 0.25 ms instead of 13 ms. Programs that link `streebog` (for
+  example through `x509gost`) but never hash no longer pay 12-20 ms at every
+  start (#7).
+
 ### Fixed
 
 ## [v0.1.0] - 2026-07-23

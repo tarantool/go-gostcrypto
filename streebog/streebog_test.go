@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"hash"
+	"strconv"
 	"testing"
 
 	"github.com/tarantool/go-gostcrypto/streebog"
@@ -209,5 +210,58 @@ func TestSizes(t *testing.T) {
 
 	if streebog.New512().Size() != 64 || streebog.New512().BlockSize() != 64 {
 		t.Fatal("512 size/blocksize wrong")
+	}
+}
+
+// benchSizes are the message lengths of the hashing benchmarks: one block, a
+// typical TLS record fragment, and a buffer long enough to hide finalisation.
+var benchSizes = []int{64, 1024, 8192}
+
+func BenchmarkSum256(b *testing.B) {
+	for _, n := range benchSizes {
+		msg := make([]byte, n)
+
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			b.SetBytes(int64(n))
+
+			for range b.N {
+				streebog.Sum256(msg)
+			}
+		})
+	}
+}
+
+func BenchmarkSum512(b *testing.B) {
+	for _, n := range benchSizes {
+		msg := make([]byte, n)
+
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			b.SetBytes(int64(n))
+
+			for range b.N {
+				streebog.Sum512(msg)
+			}
+		})
+	}
+}
+
+// BenchmarkNew256 covers the streaming path the way crypto/hmac uses it: a
+// new hash per message, Write, then Sum.
+func BenchmarkNew256(b *testing.B) {
+	for _, n := range benchSizes {
+		msg := make([]byte, n)
+
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			b.SetBytes(int64(n))
+
+			out := make([]byte, 0, 32)
+
+			for range b.N {
+				h := streebog.New256()
+				h.Write(msg)
+
+				out = h.Sum(out[:0])
+			}
+		})
 	}
 }

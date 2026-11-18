@@ -22,9 +22,12 @@ Import path: `github.com/tarantool/go-gostcrypto/streebog`
 
 Both `New256()` and `New512()` return a type that satisfies
 [`hash.Hash`](https://pkg.go.dev/hash#Hash) (asserted at compile time:
-`var _ hash.Hash = New256()`, `var _ hash.Hash = New512()`), so either drops
-directly into `crypto/hmac.New` or any other API built against that
-interface.
+`var _ hash.Hash = (*digest)(nil)`), so either drops directly into
+`crypto/hmac.New` or any other API built against that interface.
+
+The package does no work at program start. Its 1 MiB lookup table is built
+once, in about a quarter of a millisecond, by the first `New256`, `New512`,
+`Sum256` or `Sum512` call; concurrent first calls are safe.
 
 ## Usage
 

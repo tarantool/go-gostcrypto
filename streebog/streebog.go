@@ -3,6 +3,7 @@ package streebog
 import (
 	"encoding/binary"
 	"hash"
+	"sync"
 )
 
 // Sizes.
@@ -171,29 +172,76 @@ var roundConstants = [12][64]byte{
 // where a_byte_p is the byte at little-endian position p. S (the nonlinear pi
 // substitution) is NOT folded into the table — pi[0]=0xfc≠0, so LP(0)==0 but
 // LPS(0)≠0. S is instead applied at lookup time in lps() (see below).
-// lpTable is built in init() by calling linearLP (pure L∘P, no S), making the
-// table derivation independently reviewable from the spec constants.
+//
+// lpTable is derived from the spec constants by linearLP (pure L∘P, no S),
+// which keeps the table independently reviewable. It is built on first use,
+// not in init(): a program that links the package but never hashes neither
+// pays for the build nor touches the 1 MiB. See initTables.
 // ---------------------------------------------------------------------------.
 
 // lpTable[p][v] = L(P(b)) where b is the LE buffer holding byte value v at
 // position p and zero elsewhere. S is nonlinear (it maps zero bytes to
 // pi[0]=0xfc), so it is applied separately at call time; only the linear part
 // L(P(.)) is folded into the table, which IS XOR-decomposable per input byte.
+// Zero until initTables has run.
 var lpTable [64][256][8]uint64
 
-func init() {
-	for p := range 64 {
-		for v := range 256 {
+// roundConstantWords is roundConstants packed into [8]uint64 form. Zero until
+// initTables has run.
+var roundConstantWords [12][8]uint64
+
+var tablesOnce sync.Once
+
+// initTables builds lpTable and roundConstantWords exactly once. Every digest
+// goes through (*digest).setup, which calls it, so no path reaches lps() or
+// e() before the tables are filled. sync.Once also orders the writes before
+// any reader on another goroutine. The check costs one atomic load per new
+// hash or one-shot Sum, never per block, and does not depend on the data
+// being hashed.
+func initTables() {
+	tablesOnce.Do(func() {
+		buildLPTable(&lpTable)
+
+		for i := range roundConstants {
+			roundConstantWords[i] = bytesToWords(roundConstants[i])
+		}
+	})
+}
+
+// buildLPTable fills t with L(P(·)) of every single-byte input, by linearity.
+// L∘P is GF(2)-linear, so for each position p only the eight one-bit inputs
+// 1<<k go through linearLP; every other value v is the XOR of the entry for
+// its lowest set bit (v&-v) and the entry for v with that bit cleared
+// (v&(v-1)), both no greater than v and so already filled. That is 512
+// linearLP calls instead of 16 384, and the table stays derived from tau and
+// matrixA. Every entry is written, so t need not be zeroed.
+func buildLPTable(t *[64][256][8]uint64) {
+	for p := range t {
+		row := &t[p]
+
+		row[0] = [8]uint64{} // LP(0) = 0.
+
+		for k := range bitsPerByte {
 			var in [64]byte
 
-			in[p] = byte(v)
-			lpTable[p][v] = bytesToWords(linearLP(in))
+			in[p] = 1 << k
+			row[1<<k] = bytesToWords(linearLP(in))
+		}
+
+		for v := 1; v < len(row); v++ {
+			// For a power of two v&(v-1) is 0 and v&-v is v itself, so this
+			// leaves the basis entry as it is.
+			r, hi, lo := &row[v], &row[v&(v-1)], &row[v&-v]
+
+			for w := range r {
+				r[w] = hi[w] ^ lo[w]
+			}
 		}
 	}
 }
 
 // linearLP applies L(P(a)) (no S) on a little-endian [64]byte buffer. Used
-// only at init time to build lpTable.
+// only to build lpTable (and by the tests that check it).
 func linearLP(a [64]byte) [64]byte {
 	// P: P(a) = a_{tau(63)}||...||a_{tau(0)}, written MSB-first. The bytes a_i
 	// are labeled by significance (a_0 = LSB = LE index 0); the output's byte
@@ -211,6 +259,9 @@ func linearLP(a [64]byte) [64]byte {
 
 	for w := range 8 {
 		word := binary.LittleEndian.Uint64(p[8*w : 8*w+8])
+		if word == 0 {
+			continue // l(0) = 0 and out is zero already; only public inputs come here.
+		}
 
 		var acc uint64
 
@@ -305,16 +356,6 @@ func g(h, m, n [8]uint64) [8]uint64 {
 	return xor512(xor512(t, h), m)
 }
 
-// roundConstantWords is roundConstants packed into [8]uint64 form, computed in
-// init().
-var roundConstantWords [12][8]uint64
-
-func init() {
-	for i := range 12 {
-		roundConstantWords[i] = bytesToWords(roundConstants[i])
-	}
-}
-
 // add512 computes (a + b) mod 2^512 over little-endian byte buffers.
 func add512(a, b [64]byte) [64]byte {
 	var (
@@ -347,16 +388,16 @@ type digest struct {
 
 // New256 returns a hash.Hash computing the 256-bit Streebog digest.
 func New256() hash.Hash {
-	d := &digest{size: size256}
-	d.Reset()
+	d := new(digest)
+	d.setup(size256)
 
 	return d
 }
 
 // New512 returns a hash.Hash computing the 512-bit Streebog digest.
 func New512() hash.Hash {
-	d := &digest{size: size512}
-	d.Reset()
+	d := new(digest)
+	d.setup(size512)
 
 	return d
 }
@@ -381,15 +422,9 @@ func (d *digest) Size() int      { return d.size }
 func (d *digest) BlockSize() int { return blockSize }
 
 // block512le is the little-endian constant 512 used to advance the bit counter
-// by one full block (512 bits) per stage-2 step.
-var block512le = func() [64]byte {
-	var b [64]byte
-
-	b[0] = 0x00
-	b[1] = 0x02 // 0x0200 = 512.
-
-	return b
-}()
+// by one full block (512 bits) per stage-2 step. A composite literal, so the
+// linker lays it out statically and package initialisation has nothing to run.
+var block512le = [64]byte{0x00, 0x02} // 0x0200 = 512.
 
 func (d *digest) Write(p []byte) (int, error) {
 	total := len(p)
@@ -468,6 +503,17 @@ func (d *digest) Sum(in []byte) []byte {
 	return append(in, out[:]...)
 }
 
+// setup prepares d for hashing with the given output size. Every digest goes
+// through it before its first Write (digest is unexported, so callers cannot
+// make a zero one), and it makes sure the lookup tables exist before the
+// first block. A copy of a digest is made after setup, so it is covered too.
+func (d *digest) setup(size int) {
+	initTables()
+
+	d.size = size
+	d.Reset()
+}
+
 // compress runs one stage-2 step on a full block.
 func (d *digest) compress(blk [64]byte) {
 	m := bytesToWords(blk)
@@ -479,8 +525,9 @@ func (d *digest) compress(blk [64]byte) {
 
 // Sum256 returns the 256-bit Streebog digest of b.
 func Sum256(b []byte) [32]byte {
-	d := &digest{size: size256}
-	d.Reset()
+	var d digest
+
+	d.setup(size256)
 	d.Write(b) //nolint:errcheck // digest.Write never returns an error.
 
 	var out [32]byte
@@ -492,8 +539,9 @@ func Sum256(b []byte) [32]byte {
 
 // Sum512 returns the 512-bit Streebog digest of b.
 func Sum512(b []byte) [64]byte {
-	d := &digest{size: size512}
-	d.Reset()
+	var d digest
+
+	d.setup(size512)
 	d.Write(b) //nolint:errcheck // digest.Write never returns an error.
 
 	var out [64]byte
@@ -503,8 +551,6 @@ func Sum512(b []byte) [64]byte {
 	return out
 }
 
-// Conformance assertions.
-var (
-	_ hash.Hash = New256()
-	_ hash.Hash = New512()
-)
+// Conformance assertion. A nil pointer keeps it a compile-time check: calling
+// New256 here would build the tables during package initialisation.
+var _ hash.Hash = (*digest)(nil)
