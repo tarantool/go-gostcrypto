@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       compat-ref:
-        description: "gostcrypto-compat ref to test against (branch/tag/sha)"
+        description: "gostcrypto-compat ref to test against (branch/tag/sha); parity-engine's workflow file comes from master regardless"
         type: string
         default: master
 
@@ -66,41 +66,30 @@ jobs:
         working-directory: gostcrypto-compat
         run: go test ./...
 
-  # Same layout as `parity`, but additionally builds the GOST reference engine
-  # from source so the live-engine differentials in gostcrypto-compat (e.g.
-  # parity/gost28147cnt's TestDiff_GostEngineCLI, which shells out to
-  # `openssl enc -engine gost`) run against THIS commit instead of self-skipping.
+  # The same suite and layout as `parity`, plus the GOST reference engine
+  # (gost-engine) built from source, so the live-engine differentials in
+  # gostcrypto-compat (e.g. parity/gost28147cnt's TestDiff_GostEngineCLI,
+  # which shells out to `openssl enc -engine gost`) run against THIS commit
+  # instead of self-skipping. It runs once per gost-engine version named in
+  # compat's .github/gost-engine.json: the source of compat's ported vectors
+  # and the latest gost-engine release.
+  #
+  # The job is defined in compat, as the reusable workflow parity-engine.yml
+  # next to the setup-gost-engine action and the versions file, so the engine
+  # versions change in compat alone. It checks this repository out the way a
+  # plain checkout here would, at the commit under review.
+  #
+  # `uses:` takes no expressions, so the workflow definition always comes from
+  # compat master. The compat-ref input still selects the compat code, the
+  # action and the versions file it checks out, but a compat branch that
+  # changes parity-engine.yml itself is tested only by compat's own engine
+  # workflow.
   #
   # Kept separate from `parity` so the required status check stays fast and
-  # engine-free; this job carries the extra ~1-2 min engine build.
+  # engine-free; each engine job carries the extra ~1-2 min engine build.
   parity-engine:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: gostcrypto
-
-      - uses: actions/checkout@v4
-        with:
-          repository: tarantool/go-gostcrypto-compat
-          ref: ${{ github.event.inputs.compat-ref || 'master' }}
-          path: gostcrypto-compat
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-
-      # Composite action lives in gostcrypto-compat (checked out above); both
-      # this workflow and compat's own CI consume it by local path. v3.0.3 is the
-      # vector source pinned in gostcrypto-compat/docs/engine-vectors.md.
-      - uses: ./gostcrypto-compat/.github/actions/setup-gost-engine
-        with:
-          ref: v3.0.3
-
-      - name: use the go-gostcrypto checkout under review, not the released pin
-        working-directory: gostcrypto-compat
-        run: go work init . ../gostcrypto
-
-      - name: parity against the live gost-engine
-        working-directory: gostcrypto-compat
-        run: go test ./...
+    permissions:
+      contents: read
+    uses: tarantool/go-gostcrypto-compat/.github/workflows/parity-engine.yml@master
+    with:
+      compat-ref: ${{ github.event.inputs.compat-ref || 'master' }}
