@@ -158,13 +158,25 @@ each is exercised by a test vector below.
 
 2. **The S/P/L precompute table folds only the linear part.** `lpTable[p][v]`
    holds `L(P(·))` applied to a single byte value `v` at little-endian
-   position `p`, built once in `init()` from the RFC's `tau`/`matrixA`
-   constants (`linearLP`). This is intentional: the nonlinear substitution
+   position `p`, derived from the RFC's `tau`/`matrixA` constants
+   (`linearLP`). This is intentional: the nonlinear substitution
    `π` maps a zero byte to `pi[0] = 0xfc ≠ 0`, so `LP(0) == 0` but
    `LPS(0) ≠ 0` — folding `S` into the table as well would break that
    linear-only property. `S` (`pi`) is instead applied per byte at lookup
    time in `lps()`, and the eight resulting `[8]uint64` table rows are XORed
    together across the 64 input byte positions.
+
+   Because `L∘P` is linear, only the eight one-bit values `1<<k` of each
+   position go through `linearLP` (512 calls); every other entry is the XOR
+   of two smaller ones, `lpTable[p][v] = lpTable[p][v&(v-1)] ^
+   lpTable[p][v&-v]`. The 1 MiB table and the packed round constants are
+   built on first use, under a `sync.Once` that every `New256`/`New512`/
+   `Sum256`/`Sum512` goes through, not in `init()`: a program that links the
+   package but never hashes does no work for it at start and never touches
+   the table. `TestLPTableMatchesLinearLP` checks all 64×256 entries against
+   `linearLP`, and `TestFirstUseConcurrent` checks that nothing builds the
+   tables during package initialisation and that a concurrent first use is
+   race-free.
 
 3. **`N` is incremented by 512 as a little-endian 512-bit integer.** Stage 2
    adds `512` to `N` (RFC §9 Step 2) via `add512`, a carrying add over the
