@@ -25,9 +25,9 @@ Both `New256()` and `New512()` return a type that satisfies
 `var _ hash.Hash = (*digest)(nil)`), so either drops directly into
 `crypto/hmac.New` or any other API built against that interface.
 
-The package does no work at program start. Its 1 MiB lookup table is built
-once, in about a quarter of a millisecond, by the first `New256`, `New512`,
-`Sum256` or `Sum512` call; concurrent first calls are safe.
+The package does no work at program start. Its 16 KiB lookup table is built
+once, in about 15 µs, by the first `New256`, `New512`, `Sum256` or `Sum512`
+call; concurrent first calls are safe.
 
 ## Usage
 

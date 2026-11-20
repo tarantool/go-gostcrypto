@@ -164,27 +164,31 @@ var roundConstants = [12][64]byte{
 // The state is held as [8]uint64, where word[k] packs little-endian bytes
 // [8k..8k+7]: word[k] = b[8k] | b[8k+1]<<8 | ... | b[8k+7]<<56.
 //
-// Because P and L are GF(2)-linear, the combined L(P(·)) decomposes as an XOR
-// over the 64 input byte positions:
+// P transposes the state as an 8×8 matrix of bytes: byte k of input word j
+// becomes byte j of output word k (tau[8k+j] = 8j+k). L then maps every word
+// on its own, by the GF(2)-linear l. So output word k depends only on byte k
+// of each input word, and decomposes as an XOR over the eight input words:
 //
-//	LP(a) = XOR over p in 0..63 of lpTable[p][a_byte_p]
+//	LP(a)[k] = XOR over j in 0..7 of lpTable[j][byte k of a[j]]
 //
-// where a_byte_p is the byte at little-endian position p. S (the nonlinear pi
-// substitution) is NOT folded into the table — pi[0]=0xfc≠0, so LP(0)==0 but
-// LPS(0)≠0. S is instead applied at lookup time in lps() (see below).
+// where lpTable[j][v] = l(v << 8j). S (the nonlinear pi substitution) is NOT
+// folded into the table — pi[0]=0xfc≠0, so LP(0)==0 but LPS(0)≠0. S is
+// instead applied at lookup time in lps() (see below).
 //
 // lpTable is derived from the spec constants by linearLP (pure L∘P, no S),
 // which keeps the table independently reviewable. It is built on first use,
-// not in init(): a program that links the package but never hashes neither
-// pays for the build nor touches the 1 MiB. See initTables.
+// not in init(): a program that links the package but never hashes does no
+// work for it. See initTables.
 // ---------------------------------------------------------------------------.
 
-// lpTable[p][v] = L(P(b)) where b is the LE buffer holding byte value v at
-// position p and zero elsewhere. S is nonlinear (it maps zero bytes to
-// pi[0]=0xfc), so it is applied separately at call time; only the linear part
-// L(P(.)) is folded into the table, which IS XOR-decomposable per input byte.
-// Zero until initTables has run.
-var lpTable [64][256][8]uint64
+// lpTable[j][v] = l(v << 8j): word 0 of L(P(b)), where b is the LE buffer
+// holding byte value v at position 8j (byte 0 of word j) and zero elsewhere.
+// The same v as byte k of word j comes out as the same value in word k, so 8
+// rows of 256 words (16 KiB) cover all 64 byte positions. S is nonlinear (it
+// maps zero bytes to pi[0]=0xfc), so it is applied separately at call time;
+// only the linear part L(P(.)) is folded into the table. Zero until
+// initTables has run.
+var lpTable [8][256]uint64
 
 // roundConstantWords is roundConstants packed into [8]uint64 form. Zero until
 // initTables has run.
@@ -208,34 +212,29 @@ func initTables() {
 	})
 }
 
-// buildLPTable fills t with L(P(·)) of every single-byte input, by linearity.
-// L∘P is GF(2)-linear, so for each position p only the eight one-bit inputs
-// 1<<k go through linearLP; every other value v is the XOR of the entry for
-// its lowest set bit (v&-v) and the entry for v with that bit cleared
-// (v&(v-1)), both no greater than v and so already filled. That is 512
-// linearLP calls instead of 16 384, and the table stays derived from tau and
-// matrixA. Every entry is written, so t need not be zeroed.
-func buildLPTable(t *[64][256][8]uint64) {
-	for p := range t {
-		row := &t[p]
+// buildLPTable fills t by linearity. L∘P is GF(2)-linear, so for each input
+// word j only the eight one-bit values 1<<k go through linearLP; every other
+// value v is the XOR of the entry for its lowest set bit (v&-v) and the entry
+// for v with that bit cleared (v&(v-1)), both no greater than v and so
+// already filled. That is 64 linearLP calls, and the table stays derived from
+// tau and matrixA. Every entry is written, so t need not be zeroed.
+func buildLPTable(t *[8][256]uint64) {
+	for j := range t {
+		row := &t[j]
 
-		row[0] = [8]uint64{} // LP(0) = 0.
+		row[0] = 0 // LP(0) = 0.
 
 		for k := range bitsPerByte {
 			var in [64]byte
 
-			in[p] = 1 << k
-			row[1<<k] = bytesToWords(linearLP(in))
+			in[j*bytesPerWord] = 1 << k
+			row[1<<k] = bytesToWords(linearLP(in))[0]
 		}
 
 		for v := 1; v < len(row); v++ {
 			// For a power of two v&(v-1) is 0 and v&-v is v itself, so this
 			// leaves the basis entry as it is.
-			r, hi, lo := &row[v], &row[v&(v-1)], &row[v&-v]
-
-			for w := range r {
-				r[w] = hi[w] ^ lo[w]
-			}
+			row[v] = row[v&(v-1)] ^ row[v&-v]
 		}
 	}
 }
@@ -299,27 +298,22 @@ func wordsToBytes(w [8]uint64) [64]byte {
 }
 
 // lps applies L(P(S(x))) via the precomputed linear table. S (pi) is applied
-// to each input byte before the table lookup.
+// to each input byte before the table lookup. Output word k gathers byte k of
+// every input word, which is P; the lookups and their XOR are L.
 func lps(x [8]uint64) [8]uint64 {
 	var r [8]uint64
 
-	for p := range 8 {
-		word := x[p]
-		base := p * bytesPerWord
+	for k := range r {
+		s := uint(byteShift * k)
 
-		for k := range 8 {
-			b := pi[byte(word>>uint(byteShift*k))]
-			t := &lpTable[base+k][b]
-
-			r[0] ^= t[0]
-			r[1] ^= t[1]
-			r[2] ^= t[2]
-			r[3] ^= t[3]
-			r[4] ^= t[4]
-			r[5] ^= t[5]
-			r[6] ^= t[6]
-			r[7] ^= t[7]
-		}
+		r[k] = lpTable[0][pi[byte(x[0]>>s)]] ^
+			lpTable[1][pi[byte(x[1]>>s)]] ^
+			lpTable[2][pi[byte(x[2]>>s)]] ^
+			lpTable[3][pi[byte(x[3]>>s)]] ^
+			lpTable[4][pi[byte(x[4]>>s)]] ^
+			lpTable[5][pi[byte(x[5]>>s)]] ^
+			lpTable[6][pi[byte(x[6]>>s)]] ^
+			lpTable[7][pi[byte(x[7]>>s)]]
 	}
 
 	return r
