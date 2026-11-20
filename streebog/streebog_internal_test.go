@@ -2,9 +2,11 @@ package streebog
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"strings"
@@ -12,32 +14,37 @@ import (
 	"testing"
 )
 
-// TestLPTableMatchesLinearLP checks every entry of the table built by
-// linearity against linearLP itself, the way v0.1.0 built each of them.
+// TestLPTableMatchesLinearLP checks the table built by linearity against
+// linearLP for every single-byte input, the inputs v0.1.0 built its table
+// from: byte v at LE position 8j+k must come out as lpTable[j][v] in word k
+// and as zero in every other word. That checks both the build and the
+// transposition lps relies on.
 func TestLPTableMatchesLinearLP(t *testing.T) {
 	t.Parallel()
 
-	tbl := new([64][256][8]uint64)
+	tbl := new([8][256]uint64)
 
 	// Start from garbage: buildLPTable must not rely on a zeroed table.
-	for p := range tbl {
-		for v := range tbl[p] {
-			for w := range tbl[p][v] {
-				tbl[p][v][w] = 0xa5a5a5a5a5a5a5a5
-			}
+	for j := range tbl {
+		for v := range tbl[j] {
+			tbl[j][v] = 0xa5a5a5a5a5a5a5a5
 		}
 	}
 
 	buildLPTable(tbl)
 
 	for p := range 64 {
+		j, k := p/bytesPerWord, p%bytesPerWord
+
 		for v := range 256 {
-			var in [64]byte
+			var in, want [64]byte
 
 			in[p] = byte(v)
+			binary.LittleEndian.PutUint64(want[8*k:], tbl[j][v])
 
-			if want := bytesToWords(linearLP(in)); tbl[p][v] != want {
-				t.Fatalf("lpTable[%d][%#02x] = %x, want %x", p, v, tbl[p][v], want)
+			if got := linearLP(in); got != want {
+				t.Fatalf("LP(%#02x at byte %d) = %x, want lpTable[%d][%#02x] in word %d: %x",
+					v, p, got, j, v, k, want)
 			}
 		}
 	}
@@ -51,6 +58,33 @@ func TestLPTableMatchesLinearLP(t *testing.T) {
 	for i := range roundConstants {
 		if want := bytesToWords(roundConstants[i]); roundConstantWords[i] != want {
 			t.Fatalf("roundConstantWords[%d] = %x, want %x", i, roundConstantWords[i], want)
+		}
+	}
+}
+
+// TestLPSMatchesLinearLP checks lps against S applied byte by byte followed
+// by linearLP, on random states.
+func TestLPSMatchesLinearLP(t *testing.T) {
+	t.Parallel()
+
+	initTables()
+
+	rng := rand.New(rand.NewPCG(0x5354524545424f47, 1)) //nolint:gosec // Test inputs, not keys.
+
+	for range 10000 {
+		var x [8]uint64
+
+		for i := range x {
+			x[i] = rng.Uint64()
+		}
+
+		in := wordsToBytes(x)
+		for i := range in {
+			in[i] = pi[in[i]]
+		}
+
+		if got, want := lps(x), bytesToWords(linearLP(in)); got != want {
+			t.Fatalf("lps(%x) = %x, want %x", x, got, want)
 		}
 	}
 }
@@ -92,7 +126,7 @@ func firstUseConcurrent(t *testing.T) {
 
 	// Only this test runs here, so nothing has hashed yet. Filled tables mean
 	// package initialisation built them.
-	if lpTable[0][1] != ([8]uint64{}) || roundConstantWords[0] != ([8]uint64{}) {
+	if lpTable[0][1] != 0 || roundConstantWords[0] != ([8]uint64{}) {
 		t.Fatal("tables are built before the first hash")
 	}
 
@@ -155,9 +189,9 @@ func firstUseConcurrent(t *testing.T) {
 // BenchmarkLPTable measures building lpTable, the work the first hash in a
 // process pays for.
 func BenchmarkLPTable(b *testing.B) {
-	tbl := new([64][256][8]uint64)
+	tbl := new([8][256]uint64)
 
-	b.SetBytes(int64(len(tbl) * len(tbl[0]) * len(tbl[0][0]) * bytesPerWord))
+	b.SetBytes(int64(len(tbl) * len(tbl[0]) * bytesPerWord))
 	b.ResetTimer()
 
 	for range b.N {

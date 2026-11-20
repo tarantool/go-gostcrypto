@@ -156,27 +156,37 @@ each is exercised by a test vector below.
    upper half of the LE buffer (`h[32:64]`) — which is the *most-significant*
    256 bits in RFC terms.
 
-2. **The S/P/L precompute table folds only the linear part.** `lpTable[p][v]`
-   holds `L(P(·))` applied to a single byte value `v` at little-endian
-   position `p`, derived from the RFC's `tau`/`matrixA` constants
-   (`linearLP`). This is intentional: the nonlinear substitution
+2. **The S/P/L precompute table folds only the linear part.** `P` transposes
+   the state as an 8×8 byte matrix (byte `k` of word `j` becomes byte `j` of
+   word `k`), and `L` maps each word on its own. So output word `k` is the
+   XOR, over the eight input words `j`, of `l` applied to byte `k` of word
+   `j` shifted to byte position `j`. `lpTable[j][v]` holds that `l(v << 8j)`:
+   8 rows of 256 words, 16 KiB, derived from the RFC's `tau`/`matrixA`
+   constants (`linearLP`). This is intentional: the nonlinear substitution
    `π` maps a zero byte to `pi[0] = 0xfc ≠ 0`, so `LP(0) == 0` but
    `LPS(0) ≠ 0` — folding `S` into the table as well would break that
    linear-only property. `S` (`pi`) is instead applied per byte at lookup
-   time in `lps()`, and the eight resulting `[8]uint64` table rows are XORed
-   together across the 64 input byte positions.
+   time in `lps()`, and each output word is the XOR of eight lookups.
 
-   Because `L∘P` is linear, only the eight one-bit values `1<<k` of each
-   position go through `linearLP` (512 calls); every other entry is the XOR
-   of two smaller ones, `lpTable[p][v] = lpTable[p][v&(v-1)] ^
-   lpTable[p][v&-v]`. The 1 MiB table and the packed round constants are
-   built on first use, under a `sync.Once` that every `New256`/`New512`/
-   `Sum256`/`Sum512` goes through, not in `init()`: a program that links the
-   package but never hashes does no work for it at start and never touches
-   the table. `TestLPTableMatchesLinearLP` checks all 64×256 entries against
-   `linearLP`, and `TestFirstUseConcurrent` checks that nothing builds the
-   tables during package initialisation and that a concurrent first use is
-   race-free.
+   v0.1.0 kept one `[8]uint64` row for each of the 64 byte positions, 1 MiB,
+   but each row has exactly one non-zero word, the one the transposition
+   picks. Each `LPS` read 64 of those 64-byte rows from a table far larger
+   than L1 and most L2 caches; the 16 KiB table fits in L1, and hashing is
+   about 7 times faster.
+
+   Because `L∘P` is linear, only the eight one-bit values `1<<k` of each row
+   go through `linearLP` (64 calls); every other entry is the XOR of two
+   smaller ones, `lpTable[j][v] = lpTable[j][v&(v-1)] ^ lpTable[j][v&-v]`.
+   The table and the packed round constants are built on first use, under a
+   `sync.Once` that every `New256`/`New512`/`Sum256`/`Sum512` goes through,
+   not in `init()`: a program that links the package but never hashes does
+   no work for it at start and never touches the table.
+   `TestLPTableMatchesLinearLP` checks `linearLP` of a byte `v` at each of
+   the 64 positions against `lpTable[j][v]` in word `k` and zero elsewhere,
+   which covers both the build and the transposition. `TestLPSMatchesLinearLP`
+   checks `lps` against `S` followed by `linearLP` on random states, and
+   `TestFirstUseConcurrent` checks that nothing builds the tables during
+   package initialisation and that a concurrent first use is race-free.
 
 3. **`N` is incremented by 512 as a little-endian 512-bit integer.** Stage 2
    adds `512` to `N` (RFC §9 Step 2) via `add512`, a carrying add over the
